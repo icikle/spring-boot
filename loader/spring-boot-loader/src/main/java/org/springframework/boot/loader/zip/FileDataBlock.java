@@ -26,6 +26,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.StampedLock;
 import java.util.function.Supplier;
 
@@ -248,7 +249,18 @@ class FileDataBlock implements CloseableDataBlock {
 					return result;
 				}
 			}
-			long writeStamp = this.lock.writeLock();
+			long writeStamp = 0;
+			try {
+				writeStamp = this.lock.tryWriteLock(2, TimeUnit.MILLISECONDS);
+			}
+			catch (InterruptedException e) {
+				// allow to continue.
+			}
+			if (writeStamp == 0) {
+				debug.log("Optimistic read failed and recursing dangerously" );
+				// didn't lock so recurse to try again - NOT SAFE TO DO AD INFINITUM
+				return read(dst, position, closedExceptionSupplier);
+			}
 			try {
 				return readWithLockHeld(position, dst);
 			}
