@@ -251,10 +251,11 @@ class FileDataBlock implements CloseableDataBlock {
 			}
 			long writeStamp = 0;
 			try {
+				// any smaller and the scheduler and the parking wouldn't be useful and recursion too immediate.
 				writeStamp = this.lock.tryWriteLock(2, TimeUnit.MILLISECONDS);
 			}
-			catch (InterruptedException e) {
-				// allow to continue.
+			catch (InterruptedException ignore) {
+				// allow processing to continue into the next block.  Don't re-interrupt.
 			}
 			if (writeStamp == 0) {
 				debug.log("Optimistic read failed and recursing dangerously" );
