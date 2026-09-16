@@ -26,6 +26,8 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.StampedLock;
 import java.util.function.Supplier;
 
 import org.springframework.boot.loader.log.DebugLogger;
@@ -175,7 +177,7 @@ class FileDataBlock implements CloseableDataBlock {
 
 		private int bufferSize;
 
-		private final Object lock = new Object();
+		private final StampedLock lock = new StampedLock();
 
 		FileAccess(Path path) {
 			if (!Files.isRegularFile(path)) {
@@ -184,24 +186,89 @@ class FileDataBlock implements CloseableDataBlock {
 			this.path = path;
 		}
 
+		private int tryOptimisticRead(ByteBuffer dst, long position, long stamp) {
+			debug.log("Optimistic read of %s at %s", this.path, position);
+			long bufferPosition = this.bufferPosition;
+			int bufferSize = this.bufferSize;
+			ByteBuffer buffer = this.buffer;
+			if (buffer == null || position < bufferPosition || position >= bufferPosition + bufferSize) {
+				debug.log("Nothing in buffer so need to read");
+				return -1; // buffer needs to be filled so bail early.
+			}
+			int offset = (int) (position - bufferPosition);
+			int length = Math.min(bufferSize - offset, dst.remaining());
+			if (length <= 0) {
+				debug.log("Something is very wrong.");
+				return -1; // not expected to happen. Let it read.
+			}
+			byte[] tmp = new byte[length];
+			try {
+				buffer.get(offset, tmp, 0, length);
+			}
+			catch (IndexOutOfBoundsException ex) {
+				debug.log("Optimistic read failed %s", ex.getMessage());
+				return -1; // optimism was misplaced - let it read.
+			}
+			if (!this.lock.validate(stamp)) {
+				debug.log("Optimistic read failed %s", this.lock.validate(stamp));
+				return -1; // optimism was misplaced - let it read.
+			}
+			// optimism was justified.
+			dst.put(tmp, 0, length);
+			debug.log("Optimistic read succeeded");
+			return length;
+		}
+
+		private int readWithLockHeld(long position, ByteBuffer dst) throws IOException {
+			if (this.referenceCount == 0) {
+				return 0; // closed while we were waiting for the write lock
+			}
+			if (position < this.bufferPosition || position >= this.bufferPosition + this.bufferSize) {
+				fillBuffer(position);
+			}
+			if (this.bufferSize <= 0) {
+				return this.bufferSize;
+			}
+			int offset = (int) (position - this.bufferPosition);
+			int length = Math.min(this.bufferSize - offset, dst.remaining());
+			dst.put(dst.position(), this.buffer, offset, length);
+			dst.position(dst.position() + length);
+			return length;
+		}
+
 		int read(ByteBuffer dst, long position, Supplier<? extends IOException> closedExceptionSupplier)
 				throws IOException {
-			synchronized (this.lock) {
-				if (this.referenceCount == 0) {
-					throw closedExceptionSupplier.get();
-				}
-				if (position < this.bufferPosition || position >= this.bufferPosition + this.bufferSize) {
-					fillBuffer(position);
-				}
-				if (this.bufferSize <= 0) {
-					return this.bufferSize;
-				}
-				int offset = (int) (position - this.bufferPosition);
-				int length = Math.min(this.bufferSize - offset, dst.remaining());
-				dst.put(dst.position(), this.buffer, offset, length);
-				dst.position(dst.position() + length);
-				return length;
+
+			if (this.referenceCount == 0) {
+				throw closedExceptionSupplier.get();
 			}
+			long stamp = this.lock.tryOptimisticRead();
+			if (stamp != 0) {
+				int result = tryOptimisticRead(dst, position, stamp);
+				if (result != -1) {
+					return result;
+				}
+			}
+			long writeStamp = 0;
+			try {
+				// any smaller and the scheduler and the parking wouldn't be useful and recursion too immediate.
+				writeStamp = this.lock.tryWriteLock(2, TimeUnit.MILLISECONDS);
+			}
+			catch (InterruptedException ignore) {
+				// allow processing to continue into the next block.  Don't re-interrupt.
+			}
+			if (writeStamp == 0) {
+				debug.log("Optimistic read failed and recursing dangerously" );
+				// didn't lock so recurse to try again - NOT SAFE TO DO AD INFINITUM
+				return read(dst, position, closedExceptionSupplier);
+			}
+			try {
+				return readWithLockHeld(position, dst);
+			}
+			finally {
+				this.lock.unlockWrite(writeStamp);
+			}
+
 		}
 
 		private void fillBuffer(long position) throws IOException {
@@ -247,7 +314,8 @@ class FileDataBlock implements CloseableDataBlock {
 		}
 
 		void open() throws IOException {
-			synchronized (this.lock) {
+			long stamp = this.lock.writeLock();
+			try {
 				int localReferenceCount = this.referenceCount;
 				if (localReferenceCount == 0) {
 					debug.log("Opening '%s'", this.path);
@@ -258,10 +326,14 @@ class FileDataBlock implements CloseableDataBlock {
 				this.referenceCount = ++localReferenceCount;
 				debug.log("Reference count for '%s' incremented to %s", this.path, localReferenceCount);
 			}
+			finally {
+				this.lock.unlockWrite(stamp);
+			}
 		}
 
 		void close() throws IOException {
-			synchronized (this.lock) {
+			long stamp = this.lock.writeLock();
+			try {
 				int localReferenceCount = this.referenceCount;
 				if (localReferenceCount == 0) {
 					return;
@@ -282,6 +354,9 @@ class FileDataBlock implements CloseableDataBlock {
 					}
 				}
 				debug.log("Reference count for '%s' decremented to %s", this.path, localReferenceCount);
+			}
+			finally {
+				this.lock.unlockWrite(stamp);
 			}
 		}
 
