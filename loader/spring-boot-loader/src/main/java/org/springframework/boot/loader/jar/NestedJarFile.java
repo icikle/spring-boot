@@ -649,10 +649,12 @@ public class NestedJarFile extends JarFile {
 			if (!hasMoreElements()) {
 				throw new NoSuchElementException();
 			}
-			synchronized (NestedJarFile.this) {
-				ensureOpen();
-				return new NestedJarEntry(this.zipContent.getEntry(this.cursor++));
+			ensureOpen();
+			int entryIndex;
+			synchronized (this) {
+				entryIndex = this.cursor++;
 			}
+			return new NestedJarEntry(this.zipContent.getEntry(entryIndex));
 		}
 
 	}
